@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TDX Quote Verifier</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="bg-orb orb-a"></div>
+    <div class="bg-orb orb-b"></div>
+
+    <header class="topbar">
+      <div>
+        <h1>TDX Quote Verifier</h1>
+        <p>Offline cryptographic checks + Intel online attestation</p>
+      </div>
+      <div class="top-actions">
+        <button id="use-example-1" type="button" class="ghost">Load Bad Quote Example</button>
+        <button id="use-example-2" type="button" class="ghost">Load Good Quote Example</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel input-panel">
+        <h2>Input</h2>
+        <p class="muted">Paste full quote JSON (preferred) or raw quote hex.</p>
+        <textarea id="quote-input" spellcheck="false" placeholder="Paste quote JSON or hex here"></textarea>
+
+        <div class="controls">
+          <label class="checkline">
+            <input id="online-toggle" type="checkbox" checked />
+            <span>Run Intel online verification</span>
+          </label>
+
+          <label>
+            Intel API key
+            <input id="api-key" type="password" placeholder="Optional if set in server env" />
+          </label>
+
+          <label>
+            Intel base URL
+            <input id="base-url" type="text" placeholder="https://api.trustauthority.intel.com" />
+          </label>
+
+          <div class="row-split">
+            <button id="run-btn" type="button" class="primary">Verify Quote</button>
+          </div>
+        </div>
+
+        <div id="status-line" class="status-line"></div>
+      </section>
+
+      <section class="panel results-panel">
+        <h2>Checks</h2>
+        <div id="summary" class="summary"></div>
+        <div id="checks" class="checks"></div>
+      </section>
+
+      <section class="panel dump-panel">
+        <h2>Quote Dump</h2>
+        <p class="muted">Click a check to highlight referenced dump fields. Click a dump node to find related checks.</p>
+        <div id="path-info" class="path-info"></div>
+        <div id="dump" class="dump-tree"></div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
