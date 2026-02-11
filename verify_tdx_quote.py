@@ -115,10 +115,20 @@ def _must_hex_to_bytes(label: str, value: str) -> bytes:
 
 
 def extract_quote_bytes(payload: dict[str, Any]) -> bytes:
-    intel_quote_hex = payload.get("intel_quote")
-    if not isinstance(intel_quote_hex, str):
-        raise ValueError("missing or invalid 'intel_quote' field")
-    return _must_hex_to_bytes("intel_quote", intel_quote_hex)
+    quote_hex: str | None = None
+    quote_field: str | None = None
+
+    for field in ("intel_quote", "quote"):
+        candidate = payload.get(field)
+        if isinstance(candidate, str):
+            quote_hex = candidate
+            quote_field = field
+            break
+
+    if quote_hex is None or quote_field is None:
+        raise ValueError("missing or invalid 'intel_quote' or 'quote' field")
+
+    return _must_hex_to_bytes(quote_field, quote_hex)
 
 
 def _decode_jwt_claims(token: str) -> dict[str, Any]:
@@ -367,9 +377,7 @@ def _parse_certification_data_debug(cert_type: int, cert_data: bytes, include_ra
 
 
 def build_quote_debug_dump(payload: dict[str, Any], include_raw: bool = False) -> dict[str, Any]:
-    dump: dict[str, Any] = {
-        "input_fields": sorted(payload.keys()),
-    }
+    dump: dict[str, Any] = {}
 
     try:
         quote = extract_quote_bytes(payload)
@@ -449,14 +457,6 @@ def build_quote_debug_dump(payload: dict[str, Any], include_raw: bool = False) -
                 "rtmr2": td.rtmr[2].hex(),
                 "rtmr3": td.rtmr[3].hex(),
                 "report_data": td.report_data.hex(),
-                "report_data_interpretation": {
-                    "first_20_bytes_hex": td.report_data[:20].hex(),
-                    "bytes_20_to_32_hex": td.report_data[20:32].hex(),
-                    "last_32_bytes_hex": td.report_data[32:64].hex(),
-                    "looks_like_eth_address_plus_nonce": td.report_data[20:32] == b"\x00" * 12,
-                    "potential_eth_address": f"0x{td.report_data[:20].hex()}",
-                    "potential_nonce_hex": td.report_data[32:64].hex(),
-                },
             }
         except Exception as exc:
             td_dump["parse_error"] = str(exc)
@@ -515,6 +515,13 @@ def build_quote_debug_dump(payload: dict[str, Any], include_raw: bool = False) -
         dump["warnings"] = warnings
     if errors:
         dump["errors"] = errors
+
+    if "event_log" in payload:
+        event_log = payload.get("event_log")
+        if isinstance(event_log, list):
+            dump["event_log"] = event_log
+        else:
+            dump["event_log"] = {"error": f"expected list, got {type(event_log).__name__}"}
 
     return dump
 
@@ -860,31 +867,6 @@ def verify_quote_payload(payload: dict[str, Any]) -> Result:
             "quote certification data is not QE_REPORT_CERT (type 6); "
             "skipping QE binding checks"
         )
-
-    # Optional metadata consistency checks from quote.json payload.
-    signing_address = payload.get("signing_address")
-    request_nonce = payload.get("request_nonce")
-    if isinstance(signing_address, str) and isinstance(request_nonce, str):
-        try:
-            addr = _must_hex_to_bytes("signing_address", signing_address)
-            nonce = _must_hex_to_bytes("request_nonce", request_nonce)
-            if len(addr) != 20:
-                result.warn(f"signing_address is {len(addr)} bytes (expected 20)")
-            if len(nonce) != 32:
-                result.warn(f"request_nonce is {len(nonce)} bytes (expected 32)")
-
-            if len(addr) == 20 and len(nonce) == 32:
-                rd = td_body.report_data
-                if rd[:20] != addr:
-                    result.fail("TD report_data[0:20] does not match signing_address")
-                elif rd[20:32] != b"\x00" * 12:
-                    result.fail("TD report_data[20:32] is not all zeros")
-                elif rd[32:64] != nonce:
-                    result.fail("TD report_data[32:64] does not match request_nonce")
-                else:
-                    result.ok("TD report_data matches signing_address and request_nonce")
-        except ValueError as exc:
-            result.fail(str(exc))
 
     tcb_info = payload.get("tcb_info")
     if isinstance(tcb_info, dict):

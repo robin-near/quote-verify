@@ -64,7 +64,7 @@ def _parse_pasted_input(raw_input: Any) -> dict[str, Any]:
                 raise RequestError(
                     "Input is not valid JSON and not valid even-length hex. Paste full quote JSON or hex quote bytes."
                 )
-            payload = {"intel_quote": cleaned}
+            payload = {"quote": cleaned}
         else:
             if not isinstance(decoded, dict):
                 raise RequestError("Top-level JSON must be an object.")
@@ -72,8 +72,8 @@ def _parse_pasted_input(raw_input: Any) -> dict[str, Any]:
     else:
         raise RequestError("Input must be a string or object.")
 
-    if "intel_quote" not in payload:
-        raise RequestError("Input JSON does not contain 'intel_quote'.")
+    if "intel_quote" not in payload and "quote" not in payload:
+        raise RequestError("Input JSON does not contain 'intel_quote' or 'quote'.")
 
     return payload
 
@@ -417,62 +417,6 @@ def _build_offline_checks(payload: dict[str, Any]) -> tuple[list[dict[str, Any]]
             )
         )
 
-    signing_address = payload.get("signing_address")
-    request_nonce = payload.get("request_nonce")
-    if td_body is None:
-        checks.append(
-            _make_check(
-                "report_data_binding",
-                "TD REPORTDATA Metadata Binding",
-                "warn",
-                "Skipped because TD report body did not parse.",
-                refs=["td_report_body"],
-            )
-        )
-    elif isinstance(signing_address, str) and isinstance(request_nonce, str):
-        try:
-            addr = bytes.fromhex(_normalize_hex(signing_address))
-            nonce = bytes.fromhex(_normalize_hex(request_nonce))
-            rd = td_body.report_data
-            expected = addr + (b"\x00" * 12) + nonce
-            match = len(addr) == 20 and len(nonce) == 32 and rd == expected
-            status = "pass" if match else "fail"
-            checks.append(
-                _make_check(
-                    "report_data_binding",
-                    "TD REPORTDATA Metadata Binding",
-                    status,
-                    "Checks that REPORTDATA encodes signing_address || 12 zero bytes || request_nonce.",
-                    refs=["td_report_body.parsed.report_data", "td_report_body.parsed.report_data_interpretation"],
-                    evidence=[
-                        {"label": "signing_address_bytes", "value": str(len(addr))},
-                        {"label": "request_nonce_bytes", "value": str(len(nonce))},
-                        {"label": "actual_report_data", "value": rd.hex(), "ref": "td_report_body.parsed.report_data"},
-                        {"label": "expected_report_data", "value": expected.hex()},
-                    ],
-                )
-            )
-        except Exception as exc:
-            checks.append(
-                _make_check(
-                    "report_data_binding",
-                    "TD REPORTDATA Metadata Binding",
-                    "fail",
-                    f"Could not decode signing_address/request_nonce: {exc}",
-                    refs=["td_report_body.parsed.report_data"],
-                )
-            )
-    else:
-        checks.append(
-            _make_check(
-                "report_data_binding",
-                "TD REPORTDATA Metadata Binding",
-                "warn",
-                "signing_address/request_nonce not present; binding check skipped.",
-                refs=["td_report_body.parsed.report_data"],
-            )
-        )
-
     tcb_info = payload.get("tcb_info")
     if td_body is not None and isinstance(tcb_info, dict):
         expected = {
@@ -551,7 +495,13 @@ def _build_offline_checks(payload: dict[str, Any]) -> tuple[list[dict[str, Any]]
                 "Event Log Replays to RTMRs",
                 status,
                 "For each IMR, verifier starts with 48 zero bytes and repeatedly extends: next = SHA384(prev || event_digest). Final values must equal RTMR0..RTMR3 in quote.",
-                refs=["td_report_body.parsed.rtmr0", "td_report_body.parsed.rtmr1", "td_report_body.parsed.rtmr2", "td_report_body.parsed.rtmr3"],
+                refs=[
+                    "event_log",
+                    "td_report_body.parsed.rtmr0",
+                    "td_report_body.parsed.rtmr1",
+                    "td_report_body.parsed.rtmr2",
+                    "td_report_body.parsed.rtmr3",
+                ],
                 evidence=[
                     {"label": "imr0_events", "value": str(counts[0])},
                     {"label": "imr1_events", "value": str(counts[1])},
@@ -576,7 +526,13 @@ def _build_offline_checks(payload: dict[str, Any]) -> tuple[list[dict[str, Any]]
                 "Event Log Replays to RTMRs",
                 "warn",
                 "event_log is missing; replay check skipped.",
-                refs=["td_report_body.parsed.rtmr0", "td_report_body.parsed.rtmr1", "td_report_body.parsed.rtmr2", "td_report_body.parsed.rtmr3"],
+                refs=[
+                    "event_log",
+                    "td_report_body.parsed.rtmr0",
+                    "td_report_body.parsed.rtmr1",
+                    "td_report_body.parsed.rtmr2",
+                    "td_report_body.parsed.rtmr3",
+                ],
             )
         )
 

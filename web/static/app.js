@@ -121,6 +121,22 @@ function applyDumpHighlighting() {
   });
 }
 
+function firstReferencedPathInDumpOrder(refs) {
+  const uniqueRefs = [...new Set((refs || []).filter((ref) => typeof ref === "string" && ref.length > 0))];
+  if (uniqueRefs.length === 0) return null;
+
+  const refSet = new Set(uniqueRefs);
+  const nodes = dumpEl.querySelectorAll("[data-path]");
+  for (const node of nodes) {
+    const path = node.dataset.path;
+    if (refSet.has(path)) {
+      return path;
+    }
+  }
+
+  return uniqueRefs[0];
+}
+
 function setActiveCheck(checkId, scrollToRef = false, scrollInChecks = false, revealRefsOnSelect = true) {
   state.activeCheckId = checkId;
   renderChecks();
@@ -135,9 +151,10 @@ function setActiveCheck(checkId, scrollToRef = false, scrollInChecks = false, re
     refs.forEach((refPath) => {
       expandPath(refPath);
     });
-    if (refs.length > 0) {
-      scrollToPath(refs[0]);
-      setSelectedPath(refs[0], false);
+    const firstRef = firstReferencedPathInDumpOrder(refs);
+    if (firstRef) {
+      scrollToPath(firstRef);
+      setSelectedPath(firstRef, false);
     }
     return;
   }
@@ -148,7 +165,10 @@ function setActiveCheck(checkId, scrollToRef = false, scrollInChecks = false, re
     refs.forEach((refPath) => {
       expandPath(refPath);
     });
-    scrollToPath(refs[0]);
+    const firstRef = firstReferencedPathInDumpOrder(refs);
+    if (firstRef) {
+      scrollToPath(firstRef);
+    }
   }
 }
 
@@ -198,6 +218,14 @@ function formatScalar(value) {
   return JSON.stringify(value);
 }
 
+function shouldAutoExpandByDefault(path, depth) {
+  // Keep the event log collapsed by default to avoid an oversized initial tree.
+  if (path === "event_log") {
+    return false;
+  }
+  return depth < 2;
+}
+
 function renderNode(container, key, value, path, depth) {
   const isObject = value && typeof value === "object";
 
@@ -205,7 +233,7 @@ function renderNode(container, key, value, path, depth) {
     const details = document.createElement("details");
     details.className = "dump-branch dump-node";
     details.dataset.path = path;
-    details.open = depth < 2;
+    details.open = shouldAutoExpandByDefault(path, depth);
 
     const summary = document.createElement("summary");
     const keySpan = document.createElement("span");
@@ -242,7 +270,7 @@ function renderNode(container, key, value, path, depth) {
     const details = document.createElement("details");
     details.className = "dump-branch dump-node";
     details.dataset.path = path;
-    details.open = depth < 2;
+    details.open = shouldAutoExpandByDefault(path, depth);
 
     const summary = document.createElement("summary");
     const keySpan = document.createElement("span");
