@@ -31,6 +31,38 @@ def _normalize_hex(value: str) -> str:
     return value.lower().strip().removeprefix("0x")
 
 
+def _find_expected_value(payload: dict[str, Any], *keys: str) -> Any:
+    sources: list[dict[str, Any]] = []
+    for source_key in ("expected_td", "expected_td_quote_body", "tcb_info"):
+        source = payload.get(source_key)
+        if isinstance(source, dict):
+            sources.append(source)
+    sources.append(payload)
+
+    for source in sources:
+        for key in keys:
+            if key in source:
+                return source[key]
+    return None
+
+
+def _parse_expected_int(value: Any) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError("empty string")
+        try:
+            return int(text, 0)
+        except ValueError:
+            cleaned = _normalize_hex(text)
+            if not re.fullmatch(r"[0-9a-f]+", cleaned):
+                raise
+            return int(cleaned, 16)
+    raise ValueError(f"unsupported type {type(value).__name__}")
+
+
 def _make_check(
     check_id: str,
     title: str,
@@ -242,6 +274,63 @@ def _build_offline_checks(payload: dict[str, Any]) -> tuple[list[dict[str, Any]]
                 refs=["td_report_body.parsed"],
             )
         )
+
+        td_attr_u64 = int.from_bytes(td_body.td_attributes, "little")
+        td_tud_bits = td_attr_u64 & 0xFF
+        td_reserved_mask = 0
+        td_reserved_mask |= ((1 << 20) - 1) << 8  # SEC reserved bits 27:8
+        td_reserved_mask |= 1 << 29  # SEC reserved bit 29
+        td_reserved_mask |= ((1 << 31) - 1) << 32  # OTHER reserved bits 62:32
+        td_reserved_bits = td_attr_u64 & td_reserved_mask
+
+        checks.append(
+            _make_check(
+                "td_attributes_tud",
+                "TDATTRIBUTES.TUD Is Zero",
+                "pass" if td_tud_bits == 0 else "fail",
+                "TUD bits (7:0) indicate debug/untrusted state. Production policy expects these bits to be zero.",
+                refs=["td_report_body.parsed.td_attributes", "td_report_body.parsed.td_attributes_decoded.tud_bits"],
+                evidence=[
+                    {"label": "td_attributes_u64", "value": f"0x{td_attr_u64:016x}", "ref": "td_report_body.parsed.td_attributes_decoded.raw_u64"},
+                    {"label": "tud_bits", "value": f"0x{td_tud_bits:02x}", "ref": "td_report_body.parsed.td_attributes_decoded.tud_bits"},
+                ],
+            )
+        )
+
+        checks.append(
+            _make_check(
+                "td_attributes_reserved",
+                "TDATTRIBUTES Reserved Bits",
+                "pass" if td_reserved_bits == 0 else "warn",
+                (
+                    "Reserved TDATTRIBUTES bits are zero."
+                    if td_reserved_bits == 0
+                    else "Reserved TDATTRIBUTES bits are non-zero; validate platform policy compatibility."
+                ),
+                refs=["td_report_body.parsed.td_attributes", "td_report_body.parsed.td_attributes_decoded.other_bits"],
+                evidence=[
+                    {"label": "reserved_bits_masked_value", "value": f"0x{td_reserved_bits:016x}"},
+                ],
+            )
+        )
+
+        seam_attr_zero = td_body.seam_attributes == b"\x00" * 8
+        checks.append(
+            _make_check(
+                "seam_attributes_zero",
+                "SEAMATTRIBUTES Is Zero",
+                "pass" if seam_attr_zero else "warn",
+                (
+                    "SEAMATTRIBUTES is zero."
+                    if seam_attr_zero
+                    else "SEAMATTRIBUTES is non-zero; TDX 1.0 guidance expects zero."
+                ),
+                refs=["td_report_body.parsed.seam_attributes"],
+                evidence=[
+                    {"label": "seam_attributes", "value": td_body.seam_attributes.hex(), "ref": "td_report_body.parsed.seam_attributes"},
+                ],
+            )
+        )
     except Exception as exc:
         checks.append(
             _make_check(
@@ -389,6 +478,39 @@ def _build_offline_checks(payload: dict[str, Any]) -> tuple[list[dict[str, Any]]
             )
 
     if sig_data is not None and qe_data is not None:
+        qe_sig_status = "pass"
+        qe_sig_desc = "QE report signature verifies with public key from nested PCK certificate."
+        qe_sig_evidence: list[dict[str, Any]] = []
+        if qe_data.nested_type != 5:
+            qe_sig_status = "warn"
+            qe_sig_desc = (
+                "QE report signature check skipped because nested certification data is not type 5 "
+                "(PCK_CERT_CHAIN)."
+            )
+            qe_sig_evidence.append({"label": "nested_type", "value": str(qe_data.nested_type)})
+        else:
+            try:
+                verifier.verify_qe_report_signature_with_pck(qe_data)
+                qe_sig_evidence.append({"label": "nested_type", "value": "5"})
+            except Exception as exc:
+                qe_sig_status = "fail"
+                qe_sig_desc = f"QE report signature verification failed: {exc}"
+
+        checks.append(
+            _make_check(
+                "qe_report_signature",
+                "QE Report Signature",
+                qe_sig_status,
+                qe_sig_desc,
+                refs=[
+                    "signature_data.parsed.certification_data.parsed.qe_report_body",
+                    "signature_data.parsed.certification_data.parsed.qe_report_signature",
+                    "signature_data.parsed.certification_data.parsed.nested_certification_data",
+                ],
+                evidence=qe_sig_evidence,
+            )
+        )
+
         hash_input = sig_data.attest_pub_key + qe_data.qe_auth_data
         computed = hashlib.sha256(hash_input).digest()
         qe_report_data = qe_data.qe_report_body[320:384]
@@ -417,49 +539,134 @@ def _build_offline_checks(payload: dict[str, Any]) -> tuple[list[dict[str, Any]]
             )
         )
 
-    tcb_info = payload.get("tcb_info")
-    if td_body is not None and isinstance(tcb_info, dict):
-        expected = {
-            "mrtd": td_body.mr_td.hex(),
-            "rtmr0": td_body.rtmr[0].hex(),
-            "rtmr1": td_body.rtmr[1].hex(),
-            "rtmr2": td_body.rtmr[2].hex(),
-            "rtmr3": td_body.rtmr[3].hex(),
-        }
-        present = [k for k in expected if isinstance(tcb_info.get(k), str)]
-        mismatches: list[str] = []
-        for key in present:
-            if _normalize_hex(tcb_info[key]) != expected[key]:
-                mismatches.append(key)
+    if td_body is not None:
+        expected_fields = [
+            (("mrtd", "mr_td"), "mrtd_expected", "MRTD", td_body.mr_td, "td_report_body.parsed.mr_td"),
+            (("rtmr0",), "rtmr0_expected", "RTMR0", td_body.rtmr[0], "td_report_body.parsed.rtmr0"),
+            (("rtmr1",), "rtmr1_expected", "RTMR1", td_body.rtmr[1], "td_report_body.parsed.rtmr1"),
+            (("rtmr2",), "rtmr2_expected", "RTMR2", td_body.rtmr[2], "td_report_body.parsed.rtmr2"),
+            (("rtmr3",), "rtmr3_expected", "RTMR3", td_body.rtmr[3], "td_report_body.parsed.rtmr3"),
+            (("mr_config_id", "mrconfigid"), "mrconfigid_expected", "MRCONFIGID", td_body.mr_config_id, "td_report_body.parsed.mr_config_id"),
+            (("mr_owner", "mrowner"), "mrowner_expected", "MROWNER", td_body.mr_owner, "td_report_body.parsed.mr_owner"),
+            (("mr_owner_config", "mrownerconfig"), "mrownerconfig_expected", "MROWNERCONFIG", td_body.mr_owner_config, "td_report_body.parsed.mr_owner_config"),
+        ]
+        identity_policy_fields = {"MRTD", "MRCONFIGID", "MROWNER", "MROWNERCONFIG"}
+        identity_policy_checks = 0
 
-        if not present:
-            checks.append(
-                _make_check(
-                    "tcb_info_consistency",
-                    "tcb_info Consistency",
-                    "warn",
-                    "tcb_info object present but does not include mrtd/rtmr0..rtmr3 string fields.",
-                    refs=["td_report_body.parsed.mr_td", "td_report_body.parsed.rtmr0", "td_report_body.parsed.rtmr1", "td_report_body.parsed.rtmr2", "td_report_body.parsed.rtmr3"],
+        for aliases, check_id, label, actual, ref in expected_fields:
+            expected_value = _find_expected_value(payload, *aliases)
+            if not isinstance(expected_value, str):
+                continue
+
+            if label in identity_policy_fields:
+                identity_policy_checks += 1
+
+            expected_clean = _normalize_hex(expected_value)
+            if not re.fullmatch(r"[0-9a-f]*", expected_clean) or len(expected_clean) % 2 != 0:
+                checks.append(
+                    _make_check(
+                        check_id,
+                        f"{label} Matches Expected Value",
+                        "fail",
+                        f"{label} expected value is not valid hex.",
+                        refs=[ref],
+                    )
                 )
-            )
-        else:
-            status = "fail" if mismatches else "pass"
+                continue
+
+            expected_bytes = bytes.fromhex(expected_clean)
+            if len(expected_bytes) != len(actual):
+                checks.append(
+                    _make_check(
+                        check_id,
+                        f"{label} Matches Expected Value",
+                        "fail",
+                        f"{label} expected value length is {len(expected_bytes)} bytes; expected {len(actual)} bytes.",
+                        refs=[ref],
+                    )
+                )
+                continue
+
             checks.append(
                 _make_check(
-                    "tcb_info_consistency",
-                    "tcb_info Consistency",
-                    status,
+                    check_id,
+                    f"{label} Matches Expected Value",
+                    "pass" if expected_bytes == actual else "fail",
                     (
-                        "tcb_info measurements match quote measurements."
-                        if not mismatches
-                        else f"tcb_info mismatch in: {', '.join(mismatches)}"
+                        f"{label} matches expected value."
+                        if expected_bytes == actual
+                        else f"{label} does not match expected value."
                     ),
-                    refs=["td_report_body.parsed.mr_td", "td_report_body.parsed.rtmr0", "td_report_body.parsed.rtmr1", "td_report_body.parsed.rtmr2", "td_report_body.parsed.rtmr3"],
+                    refs=[ref],
                     evidence=[
-                        {"label": "present_fields", "value": ",".join(present)},
+                        {"label": "actual", "value": actual.hex(), "ref": ref},
+                        {"label": "expected", "value": expected_clean},
                     ],
                 )
             )
+
+        checks.append(
+            _make_check(
+                "identity_policy_presence",
+                "Identity Policy Values Provided",
+                "pass" if identity_policy_checks > 0 else "warn",
+                (
+                    "At least one identity policy value (MRTD/MRCONFIGID/MROWNER/MROWNERCONFIG) is provided."
+                    if identity_policy_checks > 0
+                    else "No identity policy values (MRTD/MRCONFIGID/MROWNER/MROWNERCONFIG) were provided."
+                ),
+                refs=[
+                    "td_report_body.parsed.mr_td",
+                    "td_report_body.parsed.mr_config_id",
+                    "td_report_body.parsed.mr_owner",
+                    "td_report_body.parsed.mr_owner_config",
+                ],
+            )
+        )
+
+        expected_xfam = _find_expected_value(payload, "xfam", "expected_xfam")
+        if expected_xfam is None:
+            checks.append(
+                _make_check(
+                    "xfam_expected",
+                    "XFAM Matches Expected Value",
+                    "warn",
+                    "No expected XFAM policy value was provided.",
+                    refs=["td_report_body.parsed.xfam", "td_report_body.parsed.xfam_u64"],
+                )
+            )
+        else:
+            actual_xfam = int.from_bytes(td_body.xfam, "little")
+            try:
+                parsed_expected_xfam = _parse_expected_int(expected_xfam)
+            except ValueError as exc:
+                checks.append(
+                    _make_check(
+                        "xfam_expected",
+                        "XFAM Matches Expected Value",
+                        "fail",
+                        f"Expected XFAM value is invalid: {exc}",
+                        refs=["td_report_body.parsed.xfam", "td_report_body.parsed.xfam_u64"],
+                    )
+                )
+            else:
+                checks.append(
+                    _make_check(
+                        "xfam_expected",
+                        "XFAM Matches Expected Value",
+                        "pass" if parsed_expected_xfam == actual_xfam else "fail",
+                        (
+                            "XFAM matches expected value."
+                            if parsed_expected_xfam == actual_xfam
+                            else "XFAM does not match expected value."
+                        ),
+                        refs=["td_report_body.parsed.xfam", "td_report_body.parsed.xfam_u64"],
+                        evidence=[
+                            {"label": "actual_xfam_u64", "value": f"0x{actual_xfam:016x}", "ref": "td_report_body.parsed.xfam_u64"},
+                            {"label": "expected_xfam_u64", "value": f"0x{parsed_expected_xfam:016x}"},
+                        ],
+                    )
+                )
 
     event_log = payload.get("event_log")
     if td_body is not None and isinstance(event_log, list):
@@ -535,6 +742,16 @@ def _build_offline_checks(payload: dict[str, Any]) -> tuple[list[dict[str, Any]]
                 ],
             )
         )
+
+    checks.append(
+        _make_check(
+            "offline_scope",
+            "Offline Verification Scope",
+            "warn",
+            "Offline checks do not validate PCK certificate chain trust, CRLs, QE identity collateral, or Intel TCB status/freshness. Use Intel online verification for those checks.",
+            refs=["signature_data.parsed.certification_data"],
+        )
+    )
 
     return checks, context
 

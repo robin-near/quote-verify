@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from cryptography import x509
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import ec, utils
 except Exception as exc:  # pragma: no cover
@@ -79,7 +80,16 @@ class OnlineAttestationResult:
 
 @dataclass
 class TdReportBody:
+    tee_tcb_svn: bytes
+    mr_seam: bytes
+    mr_signer_seam: bytes
+    seam_attributes: bytes
+    td_attributes: bytes
+    xfam: bytes
     mr_td: bytes
+    mr_config_id: bytes
+    mr_owner: bytes
+    mr_owner_config: bytes
     rtmr: list[bytes]
     report_data: bytes
 
@@ -231,6 +241,82 @@ def _to_yaml_like_lines(value: Any, indent: int = 0) -> list[str]:
 
 def format_yaml_like(value: Any) -> str:
     return "\n".join(_to_yaml_like_lines(value))
+
+
+def _td_attributes_u64(td_attributes: bytes) -> int:
+    if len(td_attributes) != 8:
+        raise ValueError(f"TDATTRIBUTES must be 8 bytes, got {len(td_attributes)}")
+    return int.from_bytes(td_attributes, "little")
+
+
+def _decode_td_attributes(td_attributes: bytes) -> dict[str, Any]:
+    value = _td_attributes_u64(td_attributes)
+    return {
+        "raw_hex": td_attributes.hex(),
+        "raw_u64": value,
+        "tud_bits": value & 0xFF,
+        "sec_bits": (value >> 8) & 0xFFFFFF,
+        "other_bits": (value >> 32) & 0xFFFFFFFF,
+        "flags": {
+            "debug": bool(value & (1 << 0)),
+            "sept_ve_disable": bool(value & (1 << 28)),
+            "pks": bool(value & (1 << 30)),
+            "kl": bool(value & (1 << 31)),
+            "perfmon": bool(value & (1 << 63)),
+        },
+    }
+
+
+def _extract_pem_certificates(data: bytes) -> list[x509.Certificate]:
+    pem_pattern = re.compile(
+        b"-----BEGIN CERTIFICATE-----\\s+.+?\\s+-----END CERTIFICATE-----",
+        re.DOTALL,
+    )
+    certs: list[x509.Certificate] = []
+    for block in pem_pattern.findall(data):
+        certs.append(x509.load_pem_x509_certificate(block))
+    return certs
+
+
+def _verify_ecdsa_raw_signature(public_key: Any, signature: bytes, payload: bytes) -> None:
+    if len(signature) != 64:
+        raise ValueError(f"expected 64-byte ECDSA signature, got {len(signature)}")
+    r = int.from_bytes(signature[:32], "big")
+    s = int.from_bytes(signature[32:], "big")
+    der_sig = utils.encode_dss_signature(r, s)
+    public_key.verify(der_sig, payload, ec.ECDSA(hashes.SHA256()))
+
+
+def _find_expected_value(payload: dict[str, Any], *keys: str) -> Any:
+    sources: list[dict[str, Any]] = []
+    for source_key in ("expected_td", "expected_td_quote_body", "tcb_info"):
+        source = payload.get(source_key)
+        if isinstance(source, dict):
+            sources.append(source)
+    sources.append(payload)
+
+    for source in sources:
+        for key in keys:
+            if key in source:
+                return source[key]
+    return None
+
+
+def _parse_expected_int(value: Any) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError("empty string")
+        try:
+            return int(text, 0)
+        except ValueError:
+            cleaned = _normalize_hex(text)
+            if not re.fullmatch(r"[0-9a-f]+", cleaned):
+                raise
+            return int(cleaned, 16)
+    raise ValueError(f"unsupported type {type(value).__name__}")
 
 
 def _parse_sgx_report_body_debug(body: bytes) -> dict[str, Any]:
@@ -419,39 +505,21 @@ def build_quote_debug_dump(payload: dict[str, Any], include_raw: bool = False) -
         td_dump: dict[str, Any] = {"byte_length": len(report_body)}
         try:
             td = parse_td_report_body(report_body)
-            o = 0
-            tee_tcb_svn = report_body[o : o + 16]
-            o += 16
-            mr_seam = report_body[o : o + 48]
-            o += 48
-            mr_signer_seam = report_body[o : o + 48]
-            o += 48
-            seam_attributes = report_body[o : o + 8]
-            o += 8
-            td_attributes = report_body[o : o + 8]
-            o += 8
-            xfam = report_body[o : o + 8]
-            o += 8
-            mr_td = report_body[o : o + 48]
-            o += 48
-            mr_config_id = report_body[o : o + 48]
-            o += 48
-            mr_owner = report_body[o : o + 48]
-            o += 48
-            mr_owner_config = report_body[o : o + 48]
-            o += 48
+            td_attr_decoded = _decode_td_attributes(td.td_attributes)
 
             td_dump["parsed"] = {
-                "tee_tcb_svn": tee_tcb_svn.hex(),
-                "mr_seam": mr_seam.hex(),
-                "mr_signer_seam": mr_signer_seam.hex(),
-                "seam_attributes": seam_attributes.hex(),
-                "td_attributes": td_attributes.hex(),
-                "xfam": xfam.hex(),
-                "mr_td": mr_td.hex(),
-                "mr_config_id": mr_config_id.hex(),
-                "mr_owner": mr_owner.hex(),
-                "mr_owner_config": mr_owner_config.hex(),
+                "tee_tcb_svn": td.tee_tcb_svn.hex(),
+                "mr_seam": td.mr_seam.hex(),
+                "mr_signer_seam": td.mr_signer_seam.hex(),
+                "seam_attributes": td.seam_attributes.hex(),
+                "td_attributes": td.td_attributes.hex(),
+                "td_attributes_decoded": td_attr_decoded,
+                "xfam": td.xfam.hex(),
+                "xfam_u64": int.from_bytes(td.xfam, "little"),
+                "mr_td": td.mr_td.hex(),
+                "mr_config_id": td.mr_config_id.hex(),
+                "mr_owner": td.mr_owner.hex(),
+                "mr_owner_config": td.mr_owner_config.hex(),
                 "rtmr0": td.rtmr[0].hex(),
                 "rtmr1": td.rtmr[1].hex(),
                 "rtmr2": td.rtmr[2].hex(),
@@ -617,19 +685,28 @@ def parse_td_report_body(body: bytes) -> TdReportBody:
         raise ValueError(f"invalid TDX report body length: {len(body)}")
 
     o = 0
-    o += 16  # tee_tcb_svn
-    o += 48  # mr_seam
-    o += 48  # mr_signer_seam
-    o += 8   # seam_attributes
-    o += 8   # td_attributes
-    o += 8   # xfam
+    tee_tcb_svn = body[o : o + 16]
+    o += 16
+    mr_seam = body[o : o + 48]
+    o += 48
+    mr_signer_seam = body[o : o + 48]
+    o += 48
+    seam_attributes = body[o : o + 8]
+    o += 8
+    td_attributes = body[o : o + 8]
+    o += 8
+    xfam = body[o : o + 8]
+    o += 8
 
     mr_td = body[o : o + 48]
     o += 48
 
-    o += 48  # mr_config_id
-    o += 48  # mr_owner
-    o += 48  # mr_owner_config
+    mr_config_id = body[o : o + 48]
+    o += 48
+    mr_owner = body[o : o + 48]
+    o += 48
+    mr_owner_config = body[o : o + 48]
+    o += 48
 
     rtmr = []
     for _ in range(4):
@@ -642,7 +719,20 @@ def parse_td_report_body(body: bytes) -> TdReportBody:
     if o != len(body):
         raise ValueError("internal parse error in TDX report body")
 
-    return TdReportBody(mr_td=mr_td, rtmr=rtmr, report_data=report_data)
+    return TdReportBody(
+        tee_tcb_svn=tee_tcb_svn,
+        mr_seam=mr_seam,
+        mr_signer_seam=mr_signer_seam,
+        seam_attributes=seam_attributes,
+        td_attributes=td_attributes,
+        xfam=xfam,
+        mr_td=mr_td,
+        mr_config_id=mr_config_id,
+        mr_owner=mr_owner,
+        mr_owner_config=mr_owner_config,
+        rtmr=rtmr,
+        report_data=report_data,
+    )
 
 
 def parse_quote_signature_data(sig_data: bytes) -> QuoteSignatureData:
@@ -759,6 +849,26 @@ def verify_qe_report_binding(
         raise ValueError("QE report_data trailing 32 bytes are not zero")
 
 
+def verify_qe_report_signature_with_pck(qe_report: QeReportCertificationData) -> None:
+    # The type-6 payload wraps a nested certification data blob that should contain
+    # a PCK certificate chain (type 5) for verifying the QE report signature.
+    if qe_report.nested_type != 5:
+        raise ValueError(
+            f"cannot verify QE report signature with nested certification type {qe_report.nested_type} (expected 5)"
+        )
+
+    certs = _extract_pem_certificates(qe_report.nested_data)
+    if not certs:
+        raise ValueError("nested certification data does not contain a PEM certificate chain")
+
+    pck_cert = certs[0]
+    public_key = pck_cert.public_key()
+    if not isinstance(public_key, ec.EllipticCurvePublicKey):
+        raise ValueError("PCK certificate public key is not ECDSA")
+
+    _verify_ecdsa_raw_signature(public_key, qe_report.qe_report_signature, qe_report.qe_report_body)
+
+
 def verify_event_log_against_rtmr(event_log: list[dict[str, Any]], rtmr: list[bytes]) -> None:
     calc = [b"\x00" * 48 for _ in range(4)]
     for idx, event in enumerate(event_log):
@@ -839,6 +949,35 @@ def verify_quote_payload(payload: dict[str, Any]) -> Result:
         result.fail(str(exc))
         return result
 
+    td_attr_u64 = _td_attributes_u64(td_body.td_attributes)
+    td_tud_bits = td_attr_u64 & 0xFF
+    td_reserved_mask = 0
+    td_reserved_mask |= ((1 << 20) - 1) << 8  # SEC reserved bits 27:8
+    td_reserved_mask |= 1 << 29  # SEC reserved bit 29
+    td_reserved_mask |= ((1 << 31) - 1) << 32  # OTHER reserved bits 62:32
+    td_reserved_bits = td_attr_u64 & td_reserved_mask
+
+    if td_tud_bits == 0:
+        result.ok("TDATTRIBUTES.TUD (bits 7:0) is zero (not under debug)")
+    else:
+        result.fail(f"TDATTRIBUTES.TUD is non-zero (0x{td_tud_bits:02x}); TD is under debug/untrusted")
+
+    if td_reserved_bits == 0:
+        result.ok("TDATTRIBUTES reserved bits are zero")
+    else:
+        result.warn(
+            "TDATTRIBUTES has non-zero reserved bits "
+            f"(mask value=0x{td_reserved_bits:016x}); verify platform policy compatibility"
+        )
+
+    if td_body.seam_attributes == b"\x00" * 8:
+        result.ok("SEAMATTRIBUTES is zero")
+    else:
+        result.warn(
+            "SEAMATTRIBUTES is non-zero "
+            f"(0x{td_body.seam_attributes.hex()}); TDX 1.0 expects zero"
+        )
+
     try:
         sig_data = parse_quote_signature_data(quote[sig_data_start:sig_data_end])
     except ValueError as exc:
@@ -860,6 +999,17 @@ def verify_quote_payload(payload: dict[str, Any]) -> Result:
                 "parsed QE certification data "
                 f"(nested type={qe_data.nested_type}, nested_size={len(qe_data.nested_data)})"
             )
+            if qe_data.nested_type == 5:
+                try:
+                    verify_qe_report_signature_with_pck(qe_data)
+                    result.ok("QE report signature verifies with public key from nested PCK certificate")
+                except Exception as exc:
+                    result.fail(f"QE report signature verification failed: {exc}")
+            else:
+                result.warn(
+                    "QE report signature check skipped because nested certification type is not 5 "
+                    "(PCK_CERT_CHAIN)"
+                )
         except Exception as exc:
             result.fail(f"failed QE certification data checks: {exc}")
     else:
@@ -868,22 +1018,67 @@ def verify_quote_payload(payload: dict[str, Any]) -> Result:
             "skipping QE binding checks"
         )
 
-    tcb_info = payload.get("tcb_info")
-    if isinstance(tcb_info, dict):
-        expected = {
-            "mrtd": td_body.mr_td.hex(),
-            "rtmr0": td_body.rtmr[0].hex(),
-            "rtmr1": td_body.rtmr[1].hex(),
-            "rtmr2": td_body.rtmr[2].hex(),
-            "rtmr3": td_body.rtmr[3].hex(),
-        }
-        for key, actual in expected.items():
-            value = tcb_info.get(key)
-            if isinstance(value, str):
-                if _normalize_hex(value) == actual:
-                    result.ok(f"tcb_info.{key} matches quote")
-                else:
-                    result.fail(f"tcb_info.{key} mismatch")
+    result.warn(
+        "offline checks do not validate PCK certificate chain, CRLs, QE identity, "
+        "or Intel collateral freshness; use Intel online verification for those checks"
+    )
+
+    expected_fields = [
+        (("mrtd", "mr_td"), "MRTD", td_body.mr_td),
+        (("rtmr0",), "RTMR0", td_body.rtmr[0]),
+        (("rtmr1",), "RTMR1", td_body.rtmr[1]),
+        (("rtmr2",), "RTMR2", td_body.rtmr[2]),
+        (("rtmr3",), "RTMR3", td_body.rtmr[3]),
+        (("mr_config_id", "mrconfigid"), "MRCONFIGID", td_body.mr_config_id),
+        (("mr_owner", "mrowner"), "MROWNER", td_body.mr_owner),
+        (("mr_owner_config", "mrownerconfig"), "MROWNERCONFIG", td_body.mr_owner_config),
+    ]
+
+    identity_policy_fields = {"MRTD", "MRCONFIGID", "MROWNER", "MROWNERCONFIG"}
+    identity_policy_checks = 0
+    for key_aliases, label, actual in expected_fields:
+        expected_value = _find_expected_value(payload, *key_aliases)
+        if not isinstance(expected_value, str):
+            continue
+        if label in identity_policy_fields:
+            identity_policy_checks += 1
+        try:
+            parsed = _must_hex_to_bytes(label, expected_value)
+        except ValueError as exc:
+            result.fail(f"{label} expected value is invalid: {exc}")
+            continue
+        if len(parsed) != len(actual):
+            result.fail(
+                f"{label} expected value length is {len(parsed)} bytes (expected {len(actual)})"
+            )
+            continue
+        if parsed == actual:
+            result.ok(f"{label} matches expected value")
+        else:
+            result.fail(f"{label} mismatch against expected value")
+
+    if identity_policy_checks == 0:
+        result.warn(
+            "no expected MRTD/MRCONFIGID/MROWNER/MROWNERCONFIG policy values were provided"
+        )
+
+    expected_xfam = _find_expected_value(payload, "xfam", "expected_xfam")
+    actual_xfam = int.from_bytes(td_body.xfam, "little")
+    if expected_xfam is None:
+        result.warn("no expected XFAM policy value was provided")
+    else:
+        try:
+            parsed_expected_xfam = _parse_expected_int(expected_xfam)
+        except ValueError as exc:
+            result.fail(f"XFAM expected value is invalid: {exc}")
+        else:
+            if parsed_expected_xfam == actual_xfam:
+                result.ok("XFAM matches expected value")
+            else:
+                result.fail(
+                    f"XFAM mismatch against expected value "
+                    f"(actual=0x{actual_xfam:016x}, expected=0x{parsed_expected_xfam:016x})"
+                )
 
     event_log = payload.get("event_log")
     if isinstance(event_log, list):
