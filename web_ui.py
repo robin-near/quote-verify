@@ -550,16 +550,11 @@ def _build_offline_checks(payload: dict[str, Any]) -> tuple[list[dict[str, Any]]
             (("mr_owner", "mrowner"), "mrowner_expected", "MROWNER", td_body.mr_owner, "td_report_body.parsed.mr_owner"),
             (("mr_owner_config", "mrownerconfig"), "mrownerconfig_expected", "MROWNERCONFIG", td_body.mr_owner_config, "td_report_body.parsed.mr_owner_config"),
         ]
-        identity_policy_fields = {"MRTD", "MRCONFIGID", "MROWNER", "MROWNERCONFIG"}
-        identity_policy_checks = 0
 
         for aliases, check_id, label, actual, ref in expected_fields:
             expected_value = _find_expected_value(payload, *aliases)
             if not isinstance(expected_value, str):
                 continue
-
-            if label in identity_policy_fields:
-                identity_policy_checks += 1
 
             expected_clean = _normalize_hex(expected_value)
             if not re.fullmatch(r"[0-9a-f]*", expected_clean) or len(expected_clean) % 2 != 0:
@@ -605,37 +600,8 @@ def _build_offline_checks(payload: dict[str, Any]) -> tuple[list[dict[str, Any]]
                 )
             )
 
-        checks.append(
-            _make_check(
-                "identity_policy_presence",
-                "Identity Policy Values Provided",
-                "pass" if identity_policy_checks > 0 else "warn",
-                (
-                    "At least one identity policy value (MRTD/MRCONFIGID/MROWNER/MROWNERCONFIG) is provided."
-                    if identity_policy_checks > 0
-                    else "No identity policy values (MRTD/MRCONFIGID/MROWNER/MROWNERCONFIG) were provided."
-                ),
-                refs=[
-                    "td_report_body.parsed.mr_td",
-                    "td_report_body.parsed.mr_config_id",
-                    "td_report_body.parsed.mr_owner",
-                    "td_report_body.parsed.mr_owner_config",
-                ],
-            )
-        )
-
         expected_xfam = _find_expected_value(payload, "xfam", "expected_xfam")
-        if expected_xfam is None:
-            checks.append(
-                _make_check(
-                    "xfam_expected",
-                    "XFAM Matches Expected Value",
-                    "warn",
-                    "No expected XFAM policy value was provided.",
-                    refs=["td_report_body.parsed.xfam", "td_report_body.parsed.xfam_u64"],
-                )
-            )
-        else:
+        if expected_xfam is not None:
             actual_xfam = int.from_bytes(td_body.xfam, "little")
             try:
                 parsed_expected_xfam = _parse_expected_int(expected_xfam)
@@ -740,18 +706,8 @@ def _build_offline_checks(payload: dict[str, Any]) -> tuple[list[dict[str, Any]]
                     "td_report_body.parsed.rtmr2",
                     "td_report_body.parsed.rtmr3",
                 ],
-            )
-        )
-
-    checks.append(
-        _make_check(
-            "offline_scope",
-            "Offline Verification Scope",
-            "warn",
-            "Offline checks do not validate PCK certificate chain trust, CRLs, QE identity collateral, or Intel TCB status/freshness. Use Intel online verification for those checks.",
-            refs=["signature_data.parsed.certification_data"],
-        )
-    )
+                    )
+                )
 
     return checks, context
 

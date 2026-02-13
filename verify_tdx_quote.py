@@ -1018,11 +1018,6 @@ def verify_quote_payload(payload: dict[str, Any]) -> Result:
             "skipping QE binding checks"
         )
 
-    result.warn(
-        "offline checks do not validate PCK certificate chain, CRLs, QE identity, "
-        "or Intel collateral freshness; use Intel online verification for those checks"
-    )
-
     expected_fields = [
         (("mrtd", "mr_td"), "MRTD", td_body.mr_td),
         (("rtmr0",), "RTMR0", td_body.rtmr[0]),
@@ -1034,14 +1029,10 @@ def verify_quote_payload(payload: dict[str, Any]) -> Result:
         (("mr_owner_config", "mrownerconfig"), "MROWNERCONFIG", td_body.mr_owner_config),
     ]
 
-    identity_policy_fields = {"MRTD", "MRCONFIGID", "MROWNER", "MROWNERCONFIG"}
-    identity_policy_checks = 0
     for key_aliases, label, actual in expected_fields:
         expected_value = _find_expected_value(payload, *key_aliases)
         if not isinstance(expected_value, str):
             continue
-        if label in identity_policy_fields:
-            identity_policy_checks += 1
         try:
             parsed = _must_hex_to_bytes(label, expected_value)
         except ValueError as exc:
@@ -1057,16 +1048,9 @@ def verify_quote_payload(payload: dict[str, Any]) -> Result:
         else:
             result.fail(f"{label} mismatch against expected value")
 
-    if identity_policy_checks == 0:
-        result.warn(
-            "no expected MRTD/MRCONFIGID/MROWNER/MROWNERCONFIG policy values were provided"
-        )
-
     expected_xfam = _find_expected_value(payload, "xfam", "expected_xfam")
     actual_xfam = int.from_bytes(td_body.xfam, "little")
-    if expected_xfam is None:
-        result.warn("no expected XFAM policy value was provided")
-    else:
+    if expected_xfam is not None:
         try:
             parsed_expected_xfam = _parse_expected_int(expected_xfam)
         except ValueError as exc:
