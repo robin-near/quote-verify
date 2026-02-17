@@ -51,6 +51,8 @@ CERTIFICATION_TYPE_NAMES = {
     6: "ECDSA_SIG_AUX_DATA (QE_REPORT_CERT)",
 }
 
+EVENT_LOG_DERIVABLE_EVENT_TYPE = 0x08000001
+
 
 @dataclass
 class Result:
@@ -869,28 +871,81 @@ def verify_qe_report_signature_with_pck(qe_report: QeReportCertificationData) ->
     _verify_ecdsa_raw_signature(public_key, qe_report.qe_report_signature, qe_report.qe_report_body)
 
 
-def verify_event_log_against_rtmr(event_log: list[dict[str, Any]], rtmr: list[bytes]) -> None:
+def _derive_event_log_digest_from_fields(event: dict[str, Any]) -> bytes | None:
+    event_type = event.get("event_type")
+    if not isinstance(event_type, int) or event_type != EVENT_LOG_DERIVABLE_EVENT_TYPE:
+        return None
+
+    event_name = event.get("event")
+    if not isinstance(event_name, str):
+        return None
+
+    event_payload_hex = event.get("event_payload")
+    if not isinstance(event_payload_hex, str):
+        return None
+
+    try:
+        event_payload = _must_hex_to_bytes("event_payload", event_payload_hex)
+    except ValueError:
+        return None
+
+    material = struct.pack("<I", event_type) + b":" + event_name.encode("utf-8") + b":" + event_payload
+    return hashlib.sha384(material).digest()
+
+
+def resolve_event_log_digest(event: dict[str, Any], idx: int) -> tuple[bytes, str]:
+    digest_value = event.get("digest")
+    normalized_digest = ""
+
+    if digest_value is None:
+        normalized_digest = ""
+    elif isinstance(digest_value, str):
+        normalized_digest = _normalize_hex(digest_value)
+    else:
+        raise ValueError(f"event_log[{idx}] has non-string digest")
+
+    if normalized_digest:
+        digest = _must_hex_to_bytes(f"event_log[{idx}].digest", digest_value)
+        if len(digest) != 48:
+            raise ValueError(
+                f"event_log[{idx}].digest must be 48 bytes for SHA-384, got {len(digest)}"
+            )
+        return digest, "provided"
+
+    derived_digest = _derive_event_log_digest_from_fields(event)
+    if derived_digest is not None:
+        return derived_digest, "derived"
+
+    raise ValueError(
+        f"event_log[{idx}] missing digest and derivation is unsupported for this event format"
+    )
+
+
+def verify_event_log_against_rtmr(event_log: list[dict[str, Any]], rtmr: list[bytes]) -> dict[str, Any]:
     calc = [b"\x00" * 48 for _ in range(4)]
+    counts = [0, 0, 0, 0]
+    derived_digest_event_indices: list[int] = []
+
     for idx, event in enumerate(event_log):
         imr = event.get("imr")
         if not isinstance(imr, int) or not (0 <= imr <= 3):
             continue
 
-        digest_hex = event.get("digest")
-        if not isinstance(digest_hex, str):
-            raise ValueError(f"event_log[{idx}] has non-string digest")
-
-        digest = _must_hex_to_bytes(f"event_log[{idx}].digest", digest_hex)
-        if len(digest) != 48:
-            raise ValueError(
-                f"event_log[{idx}].digest must be 48 bytes for SHA-384, got {len(digest)}"
-            )
+        digest, digest_source = resolve_event_log_digest(event, idx)
+        if digest_source == "derived":
+            derived_digest_event_indices.append(idx)
 
         calc[imr] = hashlib.sha384(calc[imr] + digest).digest()
+        counts[imr] += 1
 
     for i in range(4):
         if calc[i] != rtmr[i]:
             raise ValueError(f"RTMR{i} mismatch after replaying event log")
+
+    return {
+        "counts": counts,
+        "derived_digest_event_indices": derived_digest_event_indices,
+    }
 
 
 def verify_quote_payload(payload: dict[str, Any]) -> Result:
@@ -1067,8 +1122,16 @@ def verify_quote_payload(payload: dict[str, Any]) -> Result:
     event_log = payload.get("event_log")
     if isinstance(event_log, list):
         try:
-            verify_event_log_against_rtmr(event_log, td_body.rtmr)
+            replay_info = verify_event_log_against_rtmr(event_log, td_body.rtmr)
             result.ok("event_log replays to RTMR0..RTMR3")
+            derived_indices = replay_info.get("derived_digest_event_indices", [])
+            if derived_indices:
+                preview = ", ".join(str(index) for index in derived_indices[:8])
+                suffix = "" if len(derived_indices) <= 8 else ", ..."
+                result.warn(
+                    "event_log replay derived missing digest for "
+                    f"{len(derived_indices)} event(s) at index(es) [{preview}{suffix}]"
+                )
         except ValueError as exc:
             result.fail(str(exc))
 

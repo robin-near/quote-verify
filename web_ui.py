@@ -639,23 +639,20 @@ def _build_offline_checks(payload: dict[str, Any]) -> tuple[list[dict[str, Any]]
         calc = [b"\x00" * 48 for _ in range(4)]
         counts = [0, 0, 0, 0]
         digest_errors: list[str] = []
+        derived_digest_indices: list[int] = []
 
         for idx, event in enumerate(event_log):
             imr = event.get("imr")
             if not isinstance(imr, int) or not (0 <= imr <= 3):
                 continue
-            digest_hex = event.get("digest")
-            if not isinstance(digest_hex, str):
-                digest_errors.append(f"event[{idx}]: digest not string")
-                continue
+
             try:
-                digest = bytes.fromhex(digest_hex)
-            except Exception:
-                digest_errors.append(f"event[{idx}]: digest not hex")
+                digest, digest_source = verifier.resolve_event_log_digest(event, idx)
+            except ValueError as exc:
+                digest_errors.append(str(exc))
                 continue
-            if len(digest) != 48:
-                digest_errors.append(f"event[{idx}]: digest len {len(digest)} != 48")
-                continue
+            if digest_source == "derived":
+                derived_digest_indices.append(idx)
 
             calc[imr] = hashlib.sha384(calc[imr] + digest).digest()
             counts[imr] += 1
@@ -688,6 +685,11 @@ def _build_offline_checks(payload: dict[str, Any]) -> tuple[list[dict[str, Any]]
                     {"label": "quote_rtmr2", "value": td_body.rtmr[2].hex(), "ref": "td_report_body.parsed.rtmr2"},
                     {"label": "computed_rtmr3", "value": calc[3].hex()},
                     {"label": "quote_rtmr3", "value": td_body.rtmr[3].hex(), "ref": "td_report_body.parsed.rtmr3"},
+                    {"label": "derived_digest_events", "value": str(len(derived_digest_indices))},
+                    {
+                        "label": "derived_digest_indices",
+                        "value": ", ".join(str(i) for i in derived_digest_indices) if derived_digest_indices else "none",
+                    },
                     {"label": "digest_errors", "value": "; ".join(digest_errors) if digest_errors else "none"},
                 ],
             )
